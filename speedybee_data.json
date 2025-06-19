@@ -1,0 +1,43 @@
+{
+  "session_start": "2025-06-19T20:18:48.247253",
+  "readings": [
+    {
+      "timestamp": "2025-06-19T20:19:08.647380",
+      "status": {
+        "cycle_time": 503,
+        "i2c_errors": 0,
+        "sensors": 131,
+        "flight_mode": 131080,
+        "profile": 0,
+        "armed": false
+      },
+      "attitude": {
+        "roll": 1.5,
+        "pitch": 3.7,
+        "yaw": 22
+      },
+      "imu": {
+        "accelerometer": {
+          "x": -52,
+          "y": 36,
+          "z": 553
+        },
+        "gyroscope": {
+          "x": -14,
+          "y": -31,
+          "z": 6
+        },
+        "magnetometer": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        }
+      },
+      "altitude": {
+        "altitude_cm": 0,
+        "altitude_m": 0.0,
+        "vario": 0
+      }
+    }
+  ]
+}
