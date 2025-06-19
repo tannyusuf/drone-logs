@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Jetson Nano J202 Ubuntu 18.04 INAV SpeedyBee F405 Test Programı
+USB-Serial bağlantı optimizasyonları eklenmiş
+"""
+
+import serial
+import serial.tools.list_ports
+import struct
+import time
+import threading
+import logging
+import sys
+import os
+import json
+from datetime import datetime
+
+# Ubuntu 18.04 için UTF-8 desteği
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+# Logging ayarları
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('/home/speedybee_test.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class MSPProtocol:
+    """MSP Protokol sınıfı - INAV uyumlu - Jetson Nano optimize"""
+
+    # MSP Komutları
+    MSP_IDENT = 100
+    MSP_STATUS = 101
+    MSP_RAW_IMU = 102
+    MSP_ALTITUDE = 109
+    MSP_ATTITUDE = 108
+    MSP_ANALOG = 110
+    MSP_SET_RAW_RC = 200
+    MSP_ARM = 151
+    MSP_DISARM = 152
+
+    def __init__(self, port, baudrate=115200, timeout=2):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.serial = None
+        self.armed = False
+        self.connected = False
+
+    def connect(self):
+        """Seri porta bağlan ve test et"""
+        try:
+            logger.info(f"SpeedyBee baglantisi kuruluyor: {self.port} @ {self.baudrate}")
+            print(f"Jetson Nano USB-Serial baglantisi: {self.port}")
+
+            # Serial bağlantı kur - Jetson Nano optimizasyonları
+            self.serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=self.timeout,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                bytesize=serial.EIGHTBITS,
+                rtscts=False,  # Jetson Nano için genellikle False
+                dsrdtr=False,
+                xonxoff=False,
+                exclusive=True  # Linux için önemli
+            )
+
+            # Jetson Nano için daha uzun bekleme
+            time.sleep(2)
+
+            # Buffer temizliği
+            self.serial.reset_input_buffer()
+            self.serial.reset_output_buffer()
+
+            print(f"Seri port acildi: {self.port}")
+
+            # Bağlantı testi
+            if self.test_connection():
+                self.connected = True
+                logger.info("SpeedyBee baglantisi basarili!")
+                return True
+            else:
+                logger.error("SpeedyBee baglanti testi basarisiz")
+                return False
+
+        except serial.SerialException as e:
+            logger.error(f"Seri port hatasi: {e}")
+            print(f"Seri port hatasi: {e}")
+            print("Jetson Nano USB port kontrolu:")
+            print("sudo dmesg | tail -20")
+            print("ls -la /dev/ttyUSB* /dev/ttyACM*")
+            return False
+        except Exception as e:
+            logger.error(f"Baglanti hatasi: {e}")
+            print(f"Baglanti hatasi: {e}")
+            return False
+
+    def test_connection(self):
+        """Bağlantıyı test et - Jetson Nano optimize"""
+        print("Jetson Nano baglanti testi...")
+
+        # Jetson Nano için port izinlerini kontrol et
+        try:
+            port_stat = os.stat(self.port)
+            print(f"Port izinleri: {oct(port_stat.st_mode)}")
+        except:
+            print("Port izin kontrolu basarisiz")
+
+        # Birkaç farklı komut dene
+        test_commands = [self.MSP_IDENT, self.MSP_STATUS, self.MSP_ATTITUDE]
+
+        for cmd in test_commands:
+            try:
+                print(f"Komut test ediliyor: {cmd}")
+                self.send_command(cmd)
+
+                # Jetson Nano için daha uzun bekleme
+                start_time = time.time()
+                while time.time() - start_time < 5:  # 5 saniye bekle
+                    if self.serial.in_waiting > 0:
+                        response = self.read_response()
+                        if response:
+                            print(f"Basarili yanit alindi! Komut: {cmd}")
+                            return True
+                    time.sleep(0.1)
+
+                print(f"Komut {cmd} icin yanit alinamadi")
+
+            except Exception as e:
+                print(f"Test hatasi: {e}")
+                continue
+
+        # Manuel veri gönderme testi
+        print("Manuel veri gonderme testi...")
+        try:
+            # Basit MSP_IDENT komutu gönder
+            test_packet = b'$M<\x00\x64\x64'  # MSP_IDENT
+            self.serial.write(test_packet)
+            self.serial.flush()  # Jetson Nano için flush önemli
+            time.sleep(1)
+
+            if self.serial.in_waiting > 0:
+                data = self.serial.read(self.serial.in_waiting)
+                print(f"Ham veri alindi: {data.hex()}")
+                return True
+
+        except Exception as e:
+            print(f"Manuel test hatasi: {e}")
+
+        return False
+
+    def calculate_checksum(self, data):
+        """MSP checksum hesaplama"""
+        checksum = 0
+        for byte in data:
+            checksum ^= byte
+        return checksum
+
+    def send_command(self, command, data=None):
+        """MSP komutu gönder"""
+        if not self.serial or not self.serial.is_open:
+            return False
+
+        if data is None:
+            data = []
+
+        try:
+            # MSP header: $M<
+            header = [ord('$'), ord('M'), ord('<')]
+
+            # Data length
+            data_length = len(data)
+
+            # Command
+            cmd = command
+
+            # Checksum hesapla
+            checksum_data = [data_length, cmd] + data
+            checksum = self.calculate_checksum(checksum_data)
+
+            # Paketi oluştur
+            packet = header + [data_length, cmd] + data + [checksum]
+
+            # Gönder ve flush
+            self.serial.write(bytes(packet))
+            self.serial.flush()  # Jetson Nano için önemli
+            logger.debug(f"Komut gonderildi: {command}, Data: {data}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Komut gonderme hatasi: {e}")
+            return False
+
+    def read_response(self, timeout=3):
+        """MSP yanıtını oku - Jetson Nano optimize"""
+        if not self.serial or not self.serial.is_open:
+            return None
+
+        try:
+            start_time = time.time()
+
+            # Header bekle: $M>
+            while time.time() - start_time < timeout:
+                if self.serial.in_waiting > 0:
+                    byte = self.serial.read(1)
+                    if byte == b'$':
+                        if self.serial.read(1) == b'M':
+                            direction = self.serial.read(1)
+                            if direction == b'>':
+                                break
+                else:
+                    time.sleep(0.01)
+            else:
+                return None
+
+            # Data length
+            length_byte = self.serial.read(1)
+            if not length_byte:
+                return None
+            data_length = ord(length_byte)
+
+            # Command
+            cmd_byte = self.serial.read(1)
+            if not cmd_byte:
+                return None
+            command = ord(cmd_byte)
+
+            # Data
+            data = []
+            for _ in range(data_length):
+                data_byte = self.serial.read(1)
+                if not data_byte:
+                    return None
+                data.append(ord(data_byte))
+
+            # Checksum
+            checksum_byte = self.serial.read(1)
+            if not checksum_byte:
+                return None
+            received_checksum = ord(checksum_byte)
+
+            # Checksum doğrula
+            calculated_checksum = self.calculate_checksum([data_length, command] + data)
+
+            if received_checksum != calculated_checksum:
+                logger.warning(f"Checksum hatasi! Beklenen: {calculated_checksum}, Alinan: {received_checksum}")
+                return None
+
+            logger.debug(f"Yanit alindi: Komut={command}, Data uzunlugu={data_length}")
+            return {'command': command, 'data': data}
+
+        except Exception as e:
+            logger.error(f"Yanit okuma hatasi: {e}")
+            return None
+
+    def get_status(self):
+        """Drone durumunu al"""
+        if not self.send_command(self.MSP_STATUS):
+            return None
+
+        response = self.read_response()
+
+        if response and len(response['data']) >= 11:
+            data = response['data']
+
+            try:
+                # Cycle time
+                cycle_time = struct.unpack('<H', bytes(data[0:2]))[0]
+
+                # I2C errors
+                i2c_errors = struct.unpack('<H', bytes(data[2:4]))[0]
+
+                # Sensors
+                sensors = struct.unpack('<H', bytes(data[4:6]))[0]
+
+                # Flight mode flags
+                flight_mode = struct.unpack('<L', bytes(data[6:10]))[0]
+
+                # Profile
+                profile = data[10]
+
+                # ARM durumu kontrol et
+                self.armed = bool(flight_mode & (1 << 0))  # ARM bayrağı
+
+                return {
+                    'cycle_time': cycle_time,
+                    'i2c_errors': i2c_errors,
+                    'sensors': sensors,
+                    'flight_mode': flight_mode,
+                    'profile': profile,
+                    'armed': self.armed
+                }
+            except Exception as e:
+                logger.error(f"Status parsing hatasi: {e}")
+                return None
+        return None
+
+    def get_attitude(self):
+        """Açısal pozisyon verilerini al"""
+        if not self.send_command(self.MSP_ATTITUDE):
+            return None
+
+        response = self.read_response()
+
+        if response and len(response['data']) >= 6:
+            try:
+                # Roll, Pitch, Yaw (0.1 derece cinsinden)
+                roll = struct.unpack('<h', bytes(response['data'][0:2]))[0] / 10.0
+                pitch = struct.unpack('<h', bytes(response['data'][2:4]))[0] / 10.0
+                yaw = struct.unpack('<h', bytes(response['data'][4:6]))[0]
+
+                return {'roll': roll, 'pitch': pitch, 'yaw': yaw}
+            except Exception as e:
+                logger.error(f"Attitude parsing hatasi: {e}")
+                return None
+        return None
+
+    def get_raw_imu(self):
+        """Ham IMU verilerini al"""
+        if not self.send_command(self.MSP_RAW_IMU):
+            return None
+
+        response = self.read_response()
+
+        if response and len(response['data']) >= 18:
+            try:
+                data = response['data']
+
+                # Accelerometer (X, Y, Z)
+                acc_x = struct.unpack('<h', bytes(data[0:2]))[0]
+                acc_y = struct.unpack('<h', bytes(data[2:4]))[0]
+                acc_z = struct.unpack('<h', bytes(data[4:6]))[0]
+
+                # Gyroscope (X, Y, Z)
+                gyro_x = struct.unpack('<h', bytes(data[6:8]))[0]
+                gyro_y = struct.unpack('<h', bytes(data[8:10]))[0]
+                gyro_z = struct.unpack('<h', bytes(data[10:12]))[0]
+
+                # Magnetometer (X, Y, Z)
+                mag_x = struct.unpack('<h', bytes(data[12:14]))[0]
+                mag_y = struct.unpack('<h', bytes(data[14:16]))[0]
+                mag_z = struct.unpack('<h', bytes(data[16:18]))[0]
+
+                return {
+                    'accelerometer': {'x': acc_x, 'y': acc_y, 'z': acc_z},
+                    'gyroscope': {'x': gyro_x, 'y': gyro_y, 'z': gyro_z},
+                    'magnetometer': {'x': mag_x, 'y': mag_y, 'z': mag_z}
+                }
+            except Exception as e:
+                logger.error(f"IMU parsing hatasi: {e}")
+                return None
+        return None
+
+    def get_altitude(self):
+        """Barometrik irtifa verilerini al"""
+        if not self.send_command(self.MSP_ALTITUDE):
+            return None
+
+        response = self.read_response()
+
+        if response and len(response['data']) >= 6:
+            try:
+                # Barometric altitude (cm cinsinden)
+                altitude = struct.unpack('<l', bytes(response['data'][0:4]))[0]
+                # Vertical velocity (cm/s cinsinden)
+                vario = struct.unpack('<h', bytes(response['data'][4:6]))[0]
+
+                return {'altitude_cm': altitude, 'altitude_m': altitude / 100.0, 'vario': vario}
+            except Exception as e:
+                logger.error(f"Barometric altitude parsing hatasi: {e}")
+                return None
+        return None
+
+    def get_analog(self):
+        """Analog verilerini al (voltaj, akım, RSSI)"""
+        if not self.send_command(self.MSP_ANALOG):
+            return None
+
+        response = self.read_response()
+
+        if response and len(response['data']) >= 7:
+            try:
+                data = response['data']
+                
+                # Voltage (0.1V cinsinden)
+                voltage = data[0] / 10.0
+                
+                # mAh used
+                mah_drawn = struct.unpack('<H', bytes(data[1:3]))[0]
+                
+                # RSSI
+                rssi = struct.unpack('<H', bytes(data[3:5]))[0]
+                
+                # Amperage (0.01A cinsinden)
+                amperage = struct.unpack('<h', bytes(data[5:7]))[0] / 100.0
+
+                return {
+                    'voltage': voltage,
+                    'mah_drawn': mah_drawn,
+                    'rssi': rssi,
+                    'amperage': amperage
+                }
+            except Exception as e:
+                logger.error(f"Analog parsing hatasi: {e}")
+                return None
+        return None
+
+    def close(self):
+        """Bağlantıyı kapat"""
+        if self.serial and self.serial.is_open:
+            self.serial.close()
+            logger.info("Baglanti kapatildi")
+
+
+class JSONLogger:
+    """JSON dosyasına veri kaydetme sınıfı - tek okuma formatı"""
+    
+    def __init__(self, filename="/home/speedybee_data.json"):
+        self.filename = filename
+        self.session_start = datetime.now().isoformat()
+        print(f"JSON dosyasi: {self.filename}")
+    
+    def save_reading(self, status_data, attitude_data, imu_data, altitude_data):
+        """Tek veri okumasını kaydet - her seferinde dosyayı güncelle"""
+        current_data = {
+            "session_start": self.session_start,
+            "readings": [
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "status": status_data,
+                    "attitude": attitude_data,
+                    "imu": imu_data,
+                    "altitude": altitude_data
+                }
+            ]
+        }
+        
+        try:
+            with open(self.filename, 'w', encoding='utf-8') as f:
+                json.dump(current_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"JSON kaydetme hatasi: {e}")
+
+
+def find_serial_ports():
+    """Jetson Nano için seri portları bul"""
+    ports = serial.tools.list_ports.comports()
+    available_ports = []
+
+    print("Jetson Nano Seri Portlar:")
+    print("-" * 50)
+
+    # Linux USB portları kontrol et
+    usb_devices = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', '/dev/ttyACM1']
+    
+    print("USB Cihaz Kontrolu:")
+    for device in usb_devices:
+        if os.path.exists(device):
+            print(f"Mevcut: {device}")
+            available_ports.append(device)
+        else:
+            print(f"Yok: {device}")
+    
+    print("\nTum Port Listesi:")
+    for port in ports:
+        print(f"Port: {port.device}")
+        print(f"Aciklama: {port.description}")
+        print(f"Donanim ID: {port.hwid}")
+        print("-" * 30)
+        if port.device not in available_ports:
+            available_ports.append(port.device)
+
+    # Jetson Nano GPIO UART kontrol et
+    jetson_uart = '/dev/ttyTHS1'  # Jetson Nano UART
+    if os.path.exists(jetson_uart):
+        print(f"Jetson UART mevcut: {jetson_uart}")
+        available_ports.append(jetson_uart)
+
+    return available_ports
+
+
+def check_permissions():
+    """Jetson Nano port izinlerini kontrol et"""
+    print("\n=== Jetson Nano Port Izin Kontrolu ===")
+    
+    # Kullanıcı gruplarını kontrol et
+    try:
+        import grp, pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+        groups = [g.gr_name for g in grp.getgrall() if user in g.gr_mem]
+        primary_group = grp.getgrgid(pwd.getpwuid(os.getuid()).pw_gid).gr_name
+        groups.append(primary_group)
+        
+        print(f"Kullanici: {user}")
+        print(f"Gruplar: {', '.join(groups)}")
+        
+        if 'dialout' in groups:
+            print("✓ dialout grubu mevcut")
+        else:
+            print("✗ dialout grubu eksik!")
+            print("Cozum: sudo usermod -a -G dialout $USER")
+            print("Sonra yeniden giris yapin")
+            
+    except Exception as e:
+        print(f"Grup kontrolu hatasi: {e}")
+
+
+def test_imu_continuous():
+    """Sürekli IMU ve durum testi"""
+    print("=== Jetson Nano SpeedyBee Test ===")
+    print("Ctrl+C ile cikabilirsiniz")
+    print("Veriler JSON dosyasina kaydedilecek (her okumada guncellenecek)")
+    print()
+
+    # İzin kontrolü
+    check_permissions()
+
+    # JSON logger başlat
+    json_logger = JSONLogger()
+
+    # Port seçimi
+    ports = find_serial_ports()
+    if not ports:
+        print("Hicbir seri port bulunamadi!")
+        print("USB kablo baglantisini kontrol edin")
+        print("sudo dmesg | tail -10")
+        return
+
+    print(f"\nBulunan portlar: {', '.join(ports)}")
+    port = input("Kullanmak istedigin portu gir (orn: /dev/ttyUSB0) veya 'auto': ")
+
+    if port.lower() == 'auto':
+        # USB-Serial adaptör ara
+        usb_ports = [p for p in ports if 'USB' in p or 'ACM' in p]
+        if usb_ports:
+            port = usb_ports[0]
+            print(f"Otomatik secilen port: {port}")
+        else:
+            port = ports[0]
+            print(f"Ilk port secildi: {port}")
+
+    # Bağlantı kur
+    msp = MSPProtocol(port)
+
+    try:
+        if not msp.connect():
+            print("Baglanti kurulamadi!")
+            print("\nJetson Nano Sorun Giderme:")
+            print("1. USB kablosu kontrol edin")
+            print("2. SpeedyBee guc aliyor mu?")
+            print("3. Port izinleri: ls -la /dev/ttyUSB*")
+            print("4. dmesg | tail -20")
+            print("5. sudo chmod 666 /dev/ttyUSB0 (geçici çözüm)")
+            return
+
+        print("Baglanti basarili! Veri okuma basliyor...")
+        print("Her okuma JSON dosyasinda guncellenecek...")
+        print("=" * 80)
+
+        while True:
+            # Durum bilgisi
+            status = msp.get_status()
+            if status:
+                arm_status = "ARMED" if status['armed'] else "DISARMED"
+                print(f"Durum: {arm_status:8} | Cycle: {status['cycle_time']:4}us | I2C Err: {status['i2c_errors']:3}")
+            else:
+                print("Durum: ALINAMADI")
+
+            # Açısal pozisyon
+            attitude = msp.get_attitude()
+            if attitude:
+                print(
+                    f"Acilar: Roll={attitude['roll']:6.1f}° Pitch={attitude['pitch']:6.1f}° Yaw={attitude['yaw']:6.1f}°")
+            else:
+                print("Acilar: ALINAMADI")
+
+            # IMU verileri
+            imu = msp.get_raw_imu()
+            if imu:
+                acc = imu['accelerometer']
+                gyro = imu['gyroscope']
+                print(f"ACC: X={acc['x']:6} Y={acc['y']:6} Z={acc['z']:6}")
+                print(f"GYRO: X={gyro['x']:6} Y={gyro['y']:6} Z={gyro['z']:6}")
+            else:
+                print("IMU: ALINAMADI")
+
+            # İrtifa (Barometrik)
+            altitude = msp.get_altitude()
+            if altitude:
+                print(f"Barometre: {altitude['altitude_m']:6.2f}m | Dikey hiz: {altitude['vario']:4}cm/s")
+            else:
+                print("Barometre: ALINAMADI")
+
+            # JSON dosyasına kaydet - her okumada üzerine yaz
+            try:
+                json_logger.save_reading(status, attitude, imu, altitude)
+                print(f"[JSON] Guncel veri kaydedildi")
+            except Exception as e:
+                print(f"[JSON] Kaydetme hatasi: {e}")
+
+            print("-" * 80)
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print(f"\nTest durduruldu. Son okuma '{json_logger.filename}' dosyasinda sakli.")
+    except Exception as e:
+        print(f"Hata: {e}")
+        logger.error(f"Test hatasi: {e}")
+    finally:
+        msp.close()
+
+
+def main():
+    """Ana program"""
+    print("Jetson Nano J202 SpeedyBee F405 Test Programi")
+    print("Ubuntu 18.04 Uyumlu - JSON Kayit Ozelligi")
+    print("GUVENLIK: Pervaneleri cikarin!")
+    print("=" * 70)
+
+    try:
+        test_imu_continuous()
+    except Exception as e:
+        print(f"Program hatasi: {e}")
+        logger.error(f"Ana program hatasi: {e}")
+
+
+if __name__ == "__main__":
+    main()
